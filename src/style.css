@@ -1,0 +1,33 @@
+html {
+  background: #f3f4f6;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  background: #f3f4f6;
+}
+
+body.mbank-clone-body {
+  overflow-x: hidden;
+}
+
+#app {
+  min-height: 100vh;
+}
+
+.mbank-sync-placeholder {
+  box-sizing: border-box;
+  max-width: 720px;
+  margin: 96px auto;
+  padding: 24px 28px;
+  border: 1px solid #d8dde6;
+  border-radius: 20px;
+  background: #fff;
+  color: #0e0f11;
+  font: 500 18px/1.5 Inter, system-ui, sans-serif;
+}
+
+.mbank-sync-placeholder code {
+  font: 600 0.95em/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+}

@@ -1,11 +1,12 @@
 import { mkdir, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { createMbankAssetMirror } from './mbank-asset-mirror.mjs'
 
 const SITE_ORIGIN = 'https://mbank.kg'
 const SITE_HOSTS = new Set(['mbank.kg', 'www.mbank.kg'])
 const PAGE_OUTPUT_DIR = 'public/mbank-pages'
-const MAX_PAGES = 600
+const MAX_PAGES = parsePositiveInt(process.env.MBANK_SYNC_MAX_PAGES, 600)
 const LINK_CRAWL_DEPTH = 1
 const SITEMAP_INDEX_PATH = '/sitemap.xml'
 const REQUEST_TIMEOUT_MS = 15000
@@ -17,17 +18,26 @@ const EXCLUDED_ROUTE_PREFIXES = ['/internal/', '/webview']
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const rootDir = path.resolve(__dirname, '..')
 const outputDir = path.join(rootDir, PAGE_OUTPUT_DIR)
+const assetMirror = createMbankAssetMirror({
+  rootDir,
+  siteOrigin: SITE_ORIGIN,
+  siteHosts: SITE_HOSTS,
+  routeResolver: normalizeHrefToLocal,
+})
 
 const sitemapRoutes = await collectSitemapRoutes()
 const initialRoutes = [...new Set([...SEED_ROUTES, ...sitemapRoutes])].sort(compareRoutePriority)
 const seen = new Set()
 const queued = new Set(initialRoutes)
 const pages = []
-const manifest = {}
+const skippedRoutes = []
+const manifestRoutes = {}
+const manifestAliases = {}
 const queue = initialRoutes.map((route) => ({ depth: 0, route }))
 
 await rm(outputDir, { force: true, recursive: true })
 await mkdir(outputDir, { recursive: true })
+await assetMirror.cleanupAssets()
 
 while (queue.length > 0 && pages.length < MAX_PAGES) {
   const current = queue.shift()
@@ -38,15 +48,14 @@ while (queue.length > 0 && pages.length < MAX_PAGES) {
 
   seen.add(current.route)
 
-  let page
+  const result = await fetchPage(current.route)
 
-  try {
-    page = await fetchPage(current.route)
-  } catch (error) {
-    console.warn(`Skipping ${current.route}: ${error instanceof Error ? error.message : String(error)}`)
+  if (!result.page) {
+    skippedRoutes.push(result.skipped)
     continue
   }
 
+  const page = result.page
   pages.push(page)
 
   if (pages.length % 25 === 0) {
@@ -54,14 +63,18 @@ while (queue.length > 0 && pages.length < MAX_PAGES) {
   }
 
   const fileName = fileNameForRoute(page.path)
-  manifest[page.path] = fileName
+  manifestRoutes[page.path] = fileName
 
   if (page.path === '/en') {
-    manifest['/'] = fileName
+    manifestRoutes['/'] = fileName
+    manifestAliases['/home'] = fileName
+    manifestAliases['/en/'] = fileName
+    manifestAliases['/en/home'] = fileName
   }
 
-  if (/^\/(en|ru|ky)$/.test(page.path)) {
-    manifest[`${page.path}/home`] = fileName
+  if (page.path === '/ru' || page.path === '/ky') {
+    manifestAliases[`${page.path}/`] = fileName
+    manifestAliases[`${page.path}/home`] = fileName
   }
 
   await writeFile(path.join(outputDir, fileName), `${JSON.stringify(page)}\n`)
@@ -85,14 +98,18 @@ await writeFile(
   `${JSON.stringify(
     {
       generatedAt: new Date().toISOString(),
-      routes: manifest,
+      routes: manifestRoutes,
+      aliases: manifestAliases,
+      skippedRoutes,
     },
     null,
     2,
   )}\n`,
 )
 
-console.log(`Synced ${pages.length} MBANK page snapshots into ${PAGE_OUTPUT_DIR}`)
+console.log(
+  `Synced ${pages.length} MBANK content pages and ${skippedRoutes.length} skipped routes into ${PAGE_OUTPUT_DIR}`,
+)
 
 async function collectSitemapRoutes() {
   const sitemapIndex = await fetchText(new URL(SITEMAP_INDEX_PATH, SITE_ORIGIN))
@@ -115,6 +132,12 @@ async function collectSitemapRoutes() {
         }
       }
     } catch (error) {
+      skippedRoutes.push({
+        route: sitemapUrl.pathname,
+        category: 'endpoint',
+        reason: 'sitemap_fetch_failed',
+        detail: error instanceof Error ? error.message : String(error),
+      })
       console.warn(
         `Skipping sitemap ${sitemapUrl}: ${error instanceof Error ? error.message : String(error)}`,
       )
@@ -126,23 +149,73 @@ async function collectSitemapRoutes() {
 
 async function fetchPage(route) {
   const sourceUrl = new URL(route, SITE_ORIGIN)
-  const html = await fetchText(sourceUrl)
-  const titleMatches = [...html.matchAll(/<title>([\s\S]*?)<\/title>/gi)]
-  const appMatch = html.match(/<div id="__next">([\s\S]*?)<\/div><script/i)
-  const stylesheetMatches = [...html.matchAll(/<link[^>]+rel="stylesheet"[^>]+href="([^"]+)"/gi)]
 
-  if (titleMatches.length === 0 || !appMatch || stylesheetMatches.length === 0) {
-    throw new Error(`Could not extract page title, app markup, or stylesheet URLs from ${sourceUrl}.`)
-  }
+  try {
+    const response = await fetchTextResponse(sourceUrl)
 
-  const rawMarkup = appMatch[1].trim()
+    if (!response.ok) {
+      return {
+        skipped: makeSkippedRoute(route, classifyRoute(route), 'http_error', `${response.status} ${response.statusText}`),
+      }
+    }
 
-  return {
-    html: rewriteHtml(rawMarkup),
-    links: extractInternalRoutes(rawMarkup),
-    path: normalizeInternalRoute(route),
-    stylesheets: stylesheetsDedup(stylesheetMatches.map((match) => makeAbsolute(match[1]))),
-    title: titleMatches.at(-1)[1].trim(),
+    const contentType = response.headers.get('content-type') ?? ''
+
+    if (!contentType.includes('text/html')) {
+      return {
+        skipped: makeSkippedRoute(
+          route,
+          'endpoint',
+          'non_html_response',
+          contentType || 'Missing content-type header',
+        ),
+      }
+    }
+
+    const html = await response.text()
+    const titleMatches = [...html.matchAll(/<title>([\s\S]*?)<\/title>/gi)]
+    const appMatch = html.match(/<div id="__next">([\s\S]*?)<\/div><script/i)
+    const stylesheetMatches = [...html.matchAll(/<link[^>]+rel="stylesheet"[^>]+href="([^"]+)"/gi)]
+
+    if (titleMatches.length === 0 || !appMatch || stylesheetMatches.length === 0) {
+      return {
+        skipped: makeSkippedRoute(
+          route,
+          classifyRoute(route),
+          'missing_page_shell',
+          [
+            titleMatches.length === 0 ? 'missing title' : null,
+            !appMatch ? 'missing app shell' : null,
+            stylesheetMatches.length === 0 ? 'missing stylesheet links' : null,
+          ]
+            .filter(Boolean)
+            .join(', '),
+        ),
+      }
+    }
+
+    const rawMarkup = appMatch[1].trim()
+
+    return {
+      page: {
+        html: await assetMirror.rewriteMarkup(rawMarkup),
+        links: extractInternalRoutes(rawMarkup),
+        path: normalizeInternalRoute(route),
+        stylesheets: await assetMirror.mirrorStylesheets(
+          stylesheetMatches.map((match) => makeAbsolute(match[1])),
+        ),
+        title: titleMatches.at(-1)[1].trim(),
+      },
+    }
+  } catch (error) {
+    return {
+      skipped: makeSkippedRoute(
+        route,
+        classifyRoute(route),
+        'fetch_error',
+        error instanceof Error ? error.message : String(error),
+      ),
+    }
   }
 }
 
@@ -236,8 +309,8 @@ function makeAbsolute(value) {
   return value
 }
 
-async function fetchText(url) {
-  const response = await fetch(url, {
+async function fetchTextResponse(url) {
+  return fetch(url, {
     headers: {
       'user-agent':
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
@@ -245,6 +318,10 @@ async function fetchText(url) {
     },
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   })
+}
+
+async function fetchText(url) {
+  const response = await fetchTextResponse(url)
 
   if (!response.ok) {
     throw new Error(`Failed to fetch ${url}: ${response.status} ${response.statusText}`)
@@ -285,43 +362,36 @@ function routePriority(route) {
   return 3
 }
 
-function rewriteHtml(markup) {
-  return markup
-    .replace(/\s(?:src|poster|action)=("([^"]*)"|'([^']*)')/gi, (full, quoted, doubleValue, singleValue) => {
-      const value = doubleValue ?? singleValue ?? ''
-      const absolute = makeAbsolute(value)
-      const quote = quoted[0]
-      return full.replace(quoted, `${quote}${absolute}${quote}`)
-    })
-    .replace(/\shref=("([^"]*)"|'([^']*)')/gi, (full, quoted, doubleValue, singleValue) => {
-      const value = doubleValue ?? singleValue ?? ''
-      const localRoute = normalizeHrefToLocal(value)
-      const rewritten = localRoute ?? makeAbsolute(value)
-      const quote = quoted[0]
-      return full.replace(quoted, `${quote}${rewritten}${quote}`)
-    })
-    .replace(/\sstyle=("([^"]*)"|'([^']*)')/gi, (full, quoted, doubleValue, singleValue) => {
-      const value = doubleValue ?? singleValue ?? ''
-      const rewritten = value.replace(/url\((['"]?)(\/[^'")]+)\1\)/gi, (_match, quote, url) => {
-        return `url(${quote}${makeAbsolute(url)}${quote})`
-      })
-      const quote = quoted[0]
-      return full.replace(quoted, `${quote}${rewritten}${quote}`)
-    })
-    .replace(/\ssrcset=("([^"]*)"|'([^']*)')/gi, (full, quoted, doubleValue, singleValue) => {
-      const value = doubleValue ?? singleValue ?? ''
-      const rewritten = value
-        .split(',')
-        .map((part) => {
-          const [url, descriptor] = part.trim().split(/\s+/, 2)
-          return [makeAbsolute(url), descriptor].filter(Boolean).join(' ')
-        })
-        .join(', ')
-      const quote = quoted[0]
-      return full.replace(quoted, `${quote}${rewritten}${quote}`)
-    })
+function classifyRoute(route) {
+  const pathname = new URL(route, SITE_ORIGIN).pathname
+
+  if (
+    pathname.startsWith('/_next/') ||
+    pathname.startsWith('/api/') ||
+    pathname.startsWith('/internal/') ||
+    pathname.startsWith('/webview')
+  ) {
+    return 'endpoint'
+  }
+
+  return 'content'
 }
 
-function stylesheetsDedup(stylesheets) {
-  return [...new Set(stylesheets)]
+function makeSkippedRoute(route, category, reason, detail) {
+  return {
+    route,
+    category,
+    reason,
+    detail,
+  }
+}
+
+function parsePositiveInt(value, fallback) {
+  const parsed = Number.parseInt(value ?? '', 10)
+
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback
+  }
+
+  return parsed
 }

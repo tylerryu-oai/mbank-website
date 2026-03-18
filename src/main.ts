@@ -8,9 +8,18 @@ type PageData = {
   title: string
 }
 
+type SkippedRoute = {
+  category: 'content' | 'endpoint'
+  detail?: string
+  reason: string
+  route: string
+}
+
 type ManifestData = {
   generatedAt: string
+  aliases?: Record<string, string>
   routes: Record<string, string>
+  skippedRoutes?: SkippedRoute[]
 }
 
 const MBANK_HOSTS = new Set(['mbank.kg', 'www.mbank.kg'])
@@ -67,7 +76,7 @@ const getManifest = async () => {
 
 const getPageData = async (route: string) => {
   const manifest = await getManifest()
-  const fileName = manifest.routes[route]
+  const fileName = manifest.routes[route] ?? manifest.aliases?.[route]
 
   if (!fileName) {
     return null

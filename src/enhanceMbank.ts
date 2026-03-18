@@ -6,6 +6,8 @@ const DESKTOP_HEADER_SELECTOR = '.styles_parent__SUIpW .styles_wrapper__NFRyc'
 const DESKTOP_PRIMARY_TABS_SELECTOR =
   '.styles_header__7dm3x > .styles_flex__ztJSU > .styles_tabs__mV4dE > .style_link__LsNhc'
 const DESKTOP_ISLAMIC_TAB_SELECTOR = '.styles_header__7dm3x .styles_mainLink__v_8zY .style_link__LsNhc'
+const FOOTER_DEVELOPED_BY_SELECTOR = '.CbkFooter_developedText___cFuE'
+const FOOTER_DEVELOPED_BY_IMAGE_SELECTOR = '.CbkFooter_developed_img__K_DAH'
 const MOBILE_FOOTER_SECTION_SELECTOR = '.CbkListNavigation_wrapperMobile__KPIlK'
 const MOBILE_FOOTER_LIST_SELECTOR = '.CbkListNavigation_wrapperList__3DY_4'
 
@@ -156,6 +158,7 @@ const DESKTOP_MENU_CONFIGS: DesktopMenuConfig[] = [
 
 export const enhanceMbankPage = () => {
   revealImages()
+  replaceFooterBranding()
 
   const cleanups = [setupDesktopMegaMenu(), setupHeroSlider(), setupMobileFooterAccordions()].filter(
     (cleanup): cleanup is () => void => Boolean(cleanup),
@@ -164,6 +167,27 @@ export const enhanceMbankPage = () => {
   return () => {
     for (const cleanup of cleanups) {
       cleanup()
+    }
+  }
+}
+
+const replaceFooterBranding = () => {
+  for (const footerText of document.querySelectorAll<HTMLElement>(FOOTER_DEVELOPED_BY_SELECTOR)) {
+    footerText.childNodes.forEach((node) => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        node.textContent = (node.textContent ?? '').replace(/Developed by|Разработано/g, 'Developed by')
+      }
+    })
+
+    const imageWrapper = footerText.querySelector<HTMLElement>(FOOTER_DEVELOPED_BY_IMAGE_SELECTOR)
+
+    if (imageWrapper) {
+      imageWrapper.classList.remove('style_image__UDfa7')
+      imageWrapper.removeAttribute('style')
+      imageWrapper.innerHTML = 'Codex'
+      imageWrapper.setAttribute('aria-label', 'Codex')
+    } else if (!/Codex/.test(footerText.textContent ?? '')) {
+      footerText.append(' Codex')
     }
   }
 }

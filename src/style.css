@@ -36,6 +36,14 @@ body.mbank-loading {
   font: 600 0.95em/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
+.CbkFooter_developed_img__K_DAH[aria-label='Codex'] {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 4px;
+  color: #0092a1;
+  font: 700 13px/1 Inter, system-ui, sans-serif;
+}
+
 .mbank-mega-menu[hidden] {
   display: none;
 }
